@@ -1,2 +1,2 @@
 # goboot-arena
-goboot使用
+一些要设计的组件的实验场
