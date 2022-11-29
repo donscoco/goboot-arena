@@ -119,7 +119,7 @@ func (s *StateInof) Start() {
 		log.Println("退出 rpc服务")
 	}()
 
-	// 监听leader的心跳
+	// 不同角色要做的事情
 	go func() {
 		log.Println("启动 心跳检测")
 		s.Add(1)
