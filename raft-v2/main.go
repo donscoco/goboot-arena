@@ -18,9 +18,11 @@ import (
 /*
  */
 var addrP string
+var referrerP string
 
 func init() {
 	flag.StringVar(&addrP, "addr", "localhost:9090", "input addr")
+	flag.StringVar(&referrerP, "ref", "", "input referrer")
 }
 
 var srv Server
@@ -38,10 +40,11 @@ func main() {
 	}
 	var HeartbeatTimeout = int64(3) //单位秒
 
-	srv.Data = make(map[string]interface{})
+	srv.Data = make(map[string]interface{}) // todo 检查读写
 	srv.Term = 0
 	srv.State = Follower
 	srv.Addr = addrP
+	srv.Referrer = referrerP
 	srv.ClusterMember = ClusterMember
 	srv.HeartbeatTimeout = HeartbeatTimeout
 	srv.LogFilePath = "/tmp/log-" + addrP
@@ -69,6 +72,9 @@ const (
 	CommunicateHeartbeat = "ServerApi.Heartbeat"
 	CommunicateElection  = "ServerApi.Election"
 	CommunicateSyncLog   = "ServerApi.SyncLog"
+
+	CommunicateRegister = "ServerApi.Register"
+	CommunicateLogout   = "ServerApi.Logout"
 )
 
 /*
@@ -95,6 +101,8 @@ type Server struct {
 	Listener    net.Listener
 	LogFile     *os.File
 	LogFilePath string
+
+	Referrer string //推荐人，用于新节点加入集群，先指定一个已经在集群中的节点
 
 	context context.Context
 	cancel  context.CancelFunc
@@ -123,6 +131,18 @@ func (s *Server) Start() error {
 		log.Println("关闭rpc服务")
 	}()
 
+	// 单节点加入集群。
+	if len(s.Referrer) > 0 {
+		for i := 0; i < 3; i++ {
+			err := s.Register()
+			if err == nil {
+				break
+			}
+			log.Println(err)
+		}
+		log.Println("单节点加入集群：", s.ClusterMember)
+	}
+
 	// 启动角色工作，心跳，选举
 	go func() {
 		log.Println("启动角色服务")
@@ -136,6 +156,7 @@ func (s *Server) Start() error {
 }
 func (s *Server) Stop() error {
 	s.cancel()
+	s.Logout()
 	s.Listener.Close()
 	s.Logger.Close()
 	s.Wait()
@@ -176,6 +197,7 @@ func (s *Server) leaderJob() (err error) {
 			Heartbeat: time.Now().Unix(),
 			Term:      s.Term,
 			Offset:    s.Logger.Offset(),
+			Member:    s.ClusterMember,
 		}
 		resp := HeartbeatReply{}
 		conn, err := net.DialTimeout("tcp", addr, time.Second)
@@ -360,6 +382,7 @@ func (s *Server) LogServer() (err error) {
 		return err
 	}
 	serverLog := new(ServerLog)
+	serverLog.server = s
 	s.Logger = serverLog
 	s.Logger.File = f
 	s.LogFile = f
@@ -374,6 +397,81 @@ func (s *Server) LogServer() (err error) {
 	// todo 不应该直接让server操作文件。应该加一个中间件。但是简单做直接写文件吧
 	// 启动循环定期更新日志到磁盘中
 	return nil
+}
+func (s *Server) Register() (err error) {
+
+	client, err := rpc.Dial("tcp", s.Referrer)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	req := MemberReq{Addr: s.Addr}
+	reply := &MemberReply{}
+
+	select {
+	case <-time.After(1 * time.Second):
+		err = fmt.Errorf("call timeout")
+	case call := <-client.Go(CommunicateRegister, req, reply, nil).Done:
+		reply.Err = call.Error
+		err = call.Error
+	}
+	if err != nil {
+		log.Println("注册到集群失败")
+		return err
+	}
+	if reply.IsSuccess {
+		s.ClusterMember = reply.Member
+		log.Println("注册到集群成功")
+	}
+	return err
+
+}
+
+// todo , 如果是leader节点退出要做特殊处理
+func (s *Server) Logout() (err error) {
+
+	if s.State == Leader {
+
+		oldMember := s.ClusterMember
+		newMember := make([]string, 0, len(oldMember))
+		for _, addr := range oldMember {
+			if addr == s.Addr {
+				continue
+			}
+			newMember = append(newMember, addr)
+		}
+		s.ClusterMember = newMember
+
+		s.leaderJob() // 最后把clusterMember同步给follower
+
+		return
+	}
+
+	client, err := rpc.Dial("tcp", s.Leader)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	req := MemberReq{Addr: s.Addr}
+	reply := &MemberReply{}
+
+	select {
+	case <-time.After(1 * time.Second):
+		err = fmt.Errorf("call timeout")
+	case call := <-client.Go(CommunicateLogout, req, reply, nil).Done:
+		reply.Err = call.Error
+		err = call.Error
+	}
+	if err != nil {
+		log.Println("从集群注销失败")
+		return err
+	}
+	if reply.IsSuccess {
+		log.Println("从集群注销成功")
+	}
+	return err
 }
 
 /*
@@ -392,6 +490,8 @@ type HeartbeatReq struct {
 	Term      int64
 
 	Offset int64
+
+	Member []string
 }
 type HeartbeatReply struct {
 	Deviation int64 // 数据偏差
@@ -406,7 +506,13 @@ type ElectionReply struct {
 	IsVote     bool
 }
 
+// 心跳做三件事情
+// 同步leader
+// 同步日志
+// 同步集群成员
 func (s *ServerApi) Heartbeat(req HeartbeatReq, reply *HeartbeatReply) (err error) {
+
+	log.Printf("[debug] %+v, %+v, %+v \n", s.server.ClusterMember, s.server.State, s.server.Data)
 	if req.Term < s.server.Term { // 旧leader 发的，通知他转为follower，或者不管，这样旧leader会等到新leader给他发的心跳，自己转为follower
 		return
 	}
@@ -427,12 +533,21 @@ func (s *ServerApi) Heartbeat(req HeartbeatReq, reply *HeartbeatReply) (err erro
 	if s.server.State == Leader { // 如果自己是leader 就不用去同步log了
 		return
 	}
-	if req.Offset == s.server.Logger.Offset() {
-		return
-	}
+	//if req.Offset == s.server.Logger.Offset() {
+	//	return
+	//}
 	if req.Offset > s.server.Logger.Offset() {
 		log.Println("发现日志偏移")
 		reply.Deviation = s.server.Logger.Offset() - req.Offset
+	}
+
+	// 同步集群成员
+	//if req.Member == nil || len(req.Member) == 0 || len(req.Member) == len(s.server.ClusterMember) {
+	//	return
+	//}
+	if req.Member != nil && len(req.Member) > 0 && len(req.Member) != len(s.server.ClusterMember) {
+		s.server.ClusterMember = req.Member
+		log.Println("集群成员变更")
 	}
 	return
 }
@@ -575,7 +690,8 @@ func (s *ServerApi) Get(req ItemReq, reply *ItemReply) (err error) {
 log
 */
 type ServerLog struct {
-	File *os.File
+	server *Server
+	File   *os.File
 }
 
 func (s *ServerLog) Offset() int64 {
@@ -626,6 +742,10 @@ func (s *ServerLog) Replay(data map[string]interface{}) (err error) {
 func (s *ServerLog) Load(data map[string]interface{}, buff []byte) (err error) {
 	str := string(buff)
 	entrys := strings.Split(str, "\n")
+
+	s.server.Lock()
+	defer s.server.Unlock()
+
 	for i, entry := range entrys {
 		if i == len(entrys)-1 { // 最后一个是空的 因为每个项 是 xxx\n
 			continue
@@ -648,4 +768,67 @@ func (s *ServerLog) Close() {
 	s.File.Close()
 }
 
-// todo 单节点变更
+type MemberReq struct {
+	Addr string
+}
+type MemberReply struct {
+	IsSuccess bool
+	Member    []string
+	Err       error
+}
+
+// 这个接口负责把新节点的信息同步到leader手中。leader再负责心跳把全局的member同步给follower
+func (s *ServerApi) Register(req MemberReq, reply *MemberReply) (err error) {
+	if len(req.Addr) == 0 {
+		return
+	}
+	if s.server.State != Leader { // 不是leader代转发
+
+		log.Println("请求到了follower,代理写注册")
+
+		client, err := rpc.Dial("tcp", s.server.Leader)
+		if err != nil {
+			reply.Err = err
+			return err
+		}
+
+		select {
+		case <-time.After(1 * time.Second):
+			reply.Err = fmt.Errorf("call timeout")
+			err = fmt.Errorf("call timeout")
+		case call := <-client.Go(CommunicateRegister, req, reply, nil).Done:
+			reply.Err = call.Error
+			err = call.Error
+		}
+		if err != nil {
+			client.Close()
+			return err
+		}
+		client.Close()
+		return err
+
+	}
+	// 单节点变更，不会有其他人写ClusterMember，所以不需要加锁
+	s.server.ClusterMember = append(s.server.ClusterMember, req.Addr)
+	reply.Member = s.server.ClusterMember
+	reply.IsSuccess = true
+	return
+}
+
+func (s *ServerApi) Logout(req MemberReq, reply *MemberReply) (err error) {
+	if len(req.Addr) == 0 {
+		return
+	}
+	// 单节点变更，不会有其他人写ClusterMember，所以不需要加锁
+	oldMember := s.server.ClusterMember
+	newMember := make([]string, 0, len(oldMember))
+	for _, addr := range oldMember {
+		if addr == req.Addr {
+			continue
+		}
+		newMember = append(newMember, addr)
+	}
+	s.server.ClusterMember = newMember
+	reply.IsSuccess = true
+	return
+}

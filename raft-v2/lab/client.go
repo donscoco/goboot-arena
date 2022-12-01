@@ -8,8 +8,10 @@ import (
 
 func main() {
 
-	doSet()
-	//doGet()
+	//doSet("9090") // 集群测试
+	//doGet("9092") // 集群测试
+
+	doSet("9093") // 单节点加入后测试
 
 }
 
@@ -26,8 +28,8 @@ type ItemReply struct {
 	Err error
 }
 
-func doGet() {
-	client, err := rpc.Dial("tcp", "localhost:9092")
+func doGet(port string) {
+	client, err := rpc.Dial("tcp", "localhost:"+port)
 	if err != nil {
 		log.Println(err)
 	}
@@ -45,15 +47,15 @@ func doGet() {
 	}
 	fmt.Println(reply)
 }
-func doSet() {
-	client, err := rpc.Dial("tcp", "localhost:9091")
+func doSet(port string) {
+	client, err := rpc.Dial("tcp", "localhost:"+port)
 	if err != nil {
 		log.Println(err)
 	}
 	//defer client.Close()
 	req := ItemReq{
-		Key:   "key-4",
-		Val:   "val-4",
+		Key:   "key-5",
+		Val:   "val-5",
 		Level: 0,
 		Node:  0,
 	}
